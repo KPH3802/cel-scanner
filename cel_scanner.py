@@ -230,6 +230,12 @@ def run_scan(dry_run=False):
     if uso_chg > TRIGGER_DROP:
         print(f'  No signal (USO {uso_chg:+.2f}% > trigger {TRIGGER_DROP}%)')
         log_scan(conn, uso_chg, False, False)
+        if not dry_run:
+            today_str = datetime.utcnow().strftime('%Y-%m-%d')
+            send_email(
+                f'CEL Scanner -- No signal ({today_str})',
+                f'<html><body><p>CEL Scanner ran. USO change: {uso_chg:+.2f}%. Trigger threshold: {TRIGGER_DROP}%. No signal.</p></body></html>'
+            )
         conn.close()
         return
 
