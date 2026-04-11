@@ -40,6 +40,24 @@ TRIGGER_DROP    = config.TRIGGER_DROP_PCT   # -2.0%
 HOLD_DAYS       = config.HOLD_DAYS          # 5 trading days
 SHORT_TICKERS   = config.SHORT_TICKERS      # XOP, XLE, CVX, XOM, COP
 
+# ---------------------------------------------------------------------------
+# Signal Intelligence — live logging
+# ---------------------------------------------------------------------------
+def log_signal_intelligence(scan_date, scanner, ticker, direction, fired,
+                             signal_strength=None, signal_bucket=None,
+                             regime_filter_passed=None, regime_value=None,
+                             score=None):
+    try:
+        import sqlite3 as _sl
+        db = os.path.expanduser('~/signal_intelligence.db')
+        c = _sl.connect(db)
+        c.execute('CREATE TABLE IF NOT EXISTS signal_log (id INTEGER PRIMARY KEY AUTOINCREMENT, scan_date TEXT, scanner TEXT, ticker TEXT, direction TEXT, fired INTEGER, signal_strength REAL, signal_bucket TEXT, regime_filter_passed INTEGER, regime_value REAL, score INTEGER, autotrader_acted INTEGER, created_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+        c.execute('INSERT INTO signal_log (scan_date,scanner,ticker,direction,fired,signal_strength,signal_bucket,regime_filter_passed,regime_value,score) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                  (scan_date,scanner,ticker,direction,fired,signal_strength,signal_bucket,regime_filter_passed,regime_value,score))
+        c.commit(); c.close()
+    except Exception:
+        pass
+
 # ============================================================
 # DATABASE
 # ============================================================
@@ -227,8 +245,24 @@ def run_scan(dry_run=False):
 
     print(f'  USO latest: {trigger_date} {uso_chg:+.2f}%')
 
+    # Bucket for logging
+    if uso_chg is not None:
+        abs_chg = abs(uso_chg)
+        if abs_chg >= 5:
+            _bucket = '5+'
+        elif abs_chg >= 3:
+            _bucket = '3-5'
+        else:
+            _bucket = '2-3'
+    else:
+        _bucket = None
+
     if uso_chg > TRIGGER_DROP:
         print(f'  No signal (USO {uso_chg:+.2f}% > trigger {TRIGGER_DROP}%)')
+        # Log not-fired for each potential target
+        for _t in SHORT_TICKERS:
+            log_signal_intelligence(trigger_date, 'CEL_BEAR', _t, 'SHORT', 0,
+                                    signal_strength=uso_chg, signal_bucket=_bucket)
         log_scan(conn, uso_chg, False, False)
         if not dry_run:
             today_str = datetime.utcnow().strftime('%Y-%m-%d')
@@ -247,6 +281,10 @@ def run_scan(dry_run=False):
 
     # Signal fires
     print(f'  SIGNAL: USO {uso_chg:+.2f}% on {trigger_date} -> SHORT {SHORT_TICKERS}')
+    # Log fired for each target ticker
+    for _t in SHORT_TICKERS:
+        log_signal_intelligence(trigger_date, 'CEL_BEAR', _t, 'SHORT', 1,
+                                signal_strength=uso_chg, signal_bucket=_bucket)
     store_signal(conn, trigger_date, uso_chg)
     recent = get_recent_signals(conn)
     subject = build_email_subject()
