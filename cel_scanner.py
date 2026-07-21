@@ -58,6 +58,30 @@ def log_signal_intelligence(scan_date, scanner, ticker, direction, fired,
     except Exception:
         pass
 
+# ---------------------------------------------------------------------------
+# Run-level logging — one row per scanner run (ran-at, source status, N evaluated)
+# ---------------------------------------------------------------------------
+SIGNAL_INTEL_DB = os.path.expanduser('~/signal_intelligence.db')
+
+def log_scan_run(scanner, source_status, n_evaluated, n_fired=0, note='', db_path=None):
+    """Append exactly one row per scanner run to the shared signal-intelligence DB.
+
+    A run that evaluated nothing (empty or unreachable source) is otherwise
+    indistinguishable from a scanner that never ran: the per-signal
+    log_signal_intelligence loop is skipped when there is no data, so without
+    this row the scanner looks dead in the cross-scanner monitor. Never raises.
+    """
+    try:
+        import sqlite3 as _sl
+        db = db_path or SIGNAL_INTEL_DB
+        c = _sl.connect(db)
+        c.execute('CREATE TABLE IF NOT EXISTS scan_runs (id INTEGER PRIMARY KEY AUTOINCREMENT, ran_at TEXT DEFAULT CURRENT_TIMESTAMP, scanner TEXT, source_status TEXT, n_evaluated INTEGER, n_fired INTEGER, note TEXT)')
+        c.execute('INSERT INTO scan_runs (scanner, source_status, n_evaluated, n_fired, note) VALUES (?,?,?,?,?)',
+                  (scanner, source_status, n_evaluated, n_fired, note))
+        c.commit(); c.close()
+    except Exception:
+        pass
+
 # ============================================================
 # DATABASE
 # ============================================================
@@ -234,73 +258,84 @@ def send_email(subject, html_body):
 
 def run_scan(dry_run=False):
     print(f'CEL SCANNER -- {datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")}')
-    conn = init_db()
+    # Run-level accounting — one row logged per run in the finally block below,
+    # so an unreachable USO source ('FETCH_FAIL') is visible, not silent.
+    run = {'source_status': 'FETCH_FAIL', 'n_evaluated': 0, 'n_fired': 0}
+    try:
+        conn = init_db()
 
-    trigger_date, uso_chg = get_uso_change()
-    if uso_chg is None:
-        print('  Could not fetch USO price.')
-        log_scan(conn, 0, False, False)
-        conn.close()
-        return
+        trigger_date, uso_chg = get_uso_change()
+        if uso_chg is None:
+            print('  Could not fetch USO price.')
+            log_scan(conn, 0, False, False)
+            conn.close()
+            return
 
-    print(f'  USO latest: {trigger_date} {uso_chg:+.2f}%')
+        # Source reachable: we evaluate every candidate short target this run.
+        run['source_status'] = 'OK'
+        run['n_evaluated'] = len(SHORT_TICKERS)
 
-    # Bucket for logging
-    if uso_chg is not None:
-        abs_chg = abs(uso_chg)
-        if abs_chg >= 5:
-            _bucket = '5+'
-        elif abs_chg >= 3:
-            _bucket = '3-5'
+        print(f'  USO latest: {trigger_date} {uso_chg:+.2f}%')
+
+        # Bucket for logging
+        if uso_chg is not None:
+            abs_chg = abs(uso_chg)
+            if abs_chg >= 5:
+                _bucket = '5+'
+            elif abs_chg >= 3:
+                _bucket = '3-5'
+            else:
+                _bucket = '2-3'
         else:
-            _bucket = '2-3'
-    else:
-        _bucket = None
+            _bucket = None
 
-    if uso_chg > TRIGGER_DROP:
-        print(f'  No signal (USO {uso_chg:+.2f}% > trigger {TRIGGER_DROP}%)')
-        # Log not-fired for each potential target
+        if uso_chg > TRIGGER_DROP:
+            print(f'  No signal (USO {uso_chg:+.2f}% > trigger {TRIGGER_DROP}%)')
+            # Log not-fired for each potential target
+            for _t in SHORT_TICKERS:
+                log_signal_intelligence(trigger_date, 'CEL_BEAR', _t, 'SHORT', 0,
+                                        signal_strength=uso_chg, signal_bucket=_bucket)
+            log_scan(conn, uso_chg, False, False)
+            if not dry_run:
+                today_str = datetime.utcnow().strftime('%Y-%m-%d')
+                send_email(
+                    f'CEL Scanner -- No signal ({today_str})',
+                    f'<html><body><p>CEL Scanner ran. USO change: {uso_chg:+.2f}%. Trigger threshold: {TRIGGER_DROP}%. No signal.</p></body></html>'
+                )
+            conn.close()
+            return
+
+        if already_fired(conn, trigger_date):
+            print(f'  Signal for {trigger_date} already sent.')
+            log_scan(conn, uso_chg, False, False)
+            conn.close()
+            return
+
+        # Signal fires
+        print(f'  SIGNAL: USO {uso_chg:+.2f}% on {trigger_date} -> SHORT {SHORT_TICKERS}')
+        run['n_fired'] = len(SHORT_TICKERS)
+        # Log fired for each target ticker
         for _t in SHORT_TICKERS:
-            log_signal_intelligence(trigger_date, 'CEL_BEAR', _t, 'SHORT', 0,
+            log_signal_intelligence(trigger_date, 'CEL_BEAR', _t, 'SHORT', 1,
                                     signal_strength=uso_chg, signal_bucket=_bucket)
-        log_scan(conn, uso_chg, False, False)
-        if not dry_run:
-            today_str = datetime.utcnow().strftime('%Y-%m-%d')
-            send_email(
-                f'CEL Scanner -- No signal ({today_str})',
-                f'<html><body><p>CEL Scanner ran. USO change: {uso_chg:+.2f}%. Trigger threshold: {TRIGGER_DROP}%. No signal.</p></body></html>'
-            )
+        store_signal(conn, trigger_date, uso_chg)
+        recent = get_recent_signals(conn)
+        subject = build_email_subject()
+        html    = build_email_html(trigger_date, uso_chg, recent)
+
+        email_sent = False
+        if dry_run:
+            print(f'  DRY RUN: subject would be: {subject}')
+        else:
+            email_sent = send_email(subject, html)
+            if email_sent:
+                mark_emailed(conn, trigger_date)
+
+        log_scan(conn, uso_chg, True, email_sent)
+        print(f'  Done. Signals: {subject}')
         conn.close()
-        return
-
-    if already_fired(conn, trigger_date):
-        print(f'  Signal for {trigger_date} already sent.')
-        log_scan(conn, uso_chg, False, False)
-        conn.close()
-        return
-
-    # Signal fires
-    print(f'  SIGNAL: USO {uso_chg:+.2f}% on {trigger_date} -> SHORT {SHORT_TICKERS}')
-    # Log fired for each target ticker
-    for _t in SHORT_TICKERS:
-        log_signal_intelligence(trigger_date, 'CEL_BEAR', _t, 'SHORT', 1,
-                                signal_strength=uso_chg, signal_bucket=_bucket)
-    store_signal(conn, trigger_date, uso_chg)
-    recent = get_recent_signals(conn)
-    subject = build_email_subject()
-    html    = build_email_html(trigger_date, uso_chg, recent)
-
-    email_sent = False
-    if dry_run:
-        print(f'  DRY RUN: subject would be: {subject}')
-    else:
-        email_sent = send_email(subject, html)
-        if email_sent:
-            mark_emailed(conn, trigger_date)
-
-    log_scan(conn, uso_chg, True, email_sent)
-    print(f'  Done. Signals: {subject}')
-    conn.close()
+    finally:
+        log_scan_run('CEL', run['source_status'], run['n_evaluated'], run['n_fired'])
 
 def show_status():
     conn = init_db()
